@@ -239,3 +239,106 @@ with rasterio.open(
 print(f"✅ Saved classified GeoTIFF to {output_tif_path}")
 
 plt.show()
+
+# Applying the model to a different image and view the result
+
+import numpy as np
+import rasterio
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+import tensorflow as tf
+from sklearn.preprocessing import StandardScaler
+import os
+
+# === CONFIG ===
+BASE_PATH = '/content/drive/MyDrive/Seagrass'
+NEW_IMAGE_PATH = f'{BASE_PATH}/Raster/t3.tif'  # New image to classify
+MODEL_PATH = f'{BASE_PATH}/best_model_fold2.h5'  # Update X with your best fold
+OUTPUT_TIF_PATH = f'{BASE_PATH}/Raster/classified_new.tif'
+OUTPUT_PNG_PATH = f'{BASE_PATH}/classified_new.png'
+
+# Label map (must match training)
+label_map = {
+    'seagrass': 0, 'land': 1, 'mangroves': 2,
+    'water': 3, 'othervegetation': 4
+}
+inv_label_map = {v: k for k, v in label_map.items()}
+
+# Color map
+color_map = np.array([
+    [144, 238, 144],  # seagrass
+    [139, 69, 19],    # land
+    [34, 139, 34],     # mangroves
+    [0, 191, 255],     # water
+    [0, 100, 0]        # othervegetation
+]) / 255  # Normalized for matplotlib
+
+# === Load Model ===
+print("⏳ Loading trained model...")
+model = tf.keras.models.load_model(MODEL_PATH)
+print("✅ Model loaded successfully")
+
+# === Load and Preprocess New Image ===
+with rasterio.open(NEW_IMAGE_PATH) as src:
+    image = np.transpose(src.read(), (1, 2, 0))
+    profile = src.profile
+    transform = src.transform
+    crs = src.crs
+
+# StandardScaler (use same as training)
+scaler = StandardScaler()
+H, W, B = image.shape
+flat_pixels = image.reshape(-1, B)
+flat_scaled = scaler.fit_transform(flat_pixels)  # Note: Should use training scaler in practice
+flat_scaled = flat_scaled[..., np.newaxis]
+
+# === Predict ===
+print("⏳ Classifying image...")
+pred_labels = np.zeros(flat_scaled.shape[0], dtype=np.uint8)
+batch_size = 8192  # Reduce if memory issues occur
+
+for i in range(0, len(flat_scaled), batch_size):
+    batch = flat_scaled[i:i+batch_size]
+    preds = model.predict(batch, verbose=0)
+    pred_labels[i:i+batch_size] = np.argmax(preds, axis=1)
+
+classified_image = pred_labels.reshape(H, W)
+print("✅ Classification complete")
+
+# === Save GeoTIFF ===
+profile.update(
+    dtype=rasterio.uint8,
+    count=1,
+    compress='lzw',
+    nodata=0 # Explicitly set nodata to a value compatible with uint8
+)
+
+with rasterio.open(OUTPUT_TIF_PATH, 'w', **profile) as dst:
+    dst.write(classified_image.astype(np.uint8), 1)
+print(f"💾 Saved GeoTIFF to {OUTPUT_TIF_PATH}")
+
+# === Visualize ===
+rgb_image = color_map[classified_image]
+
+plt.figure(figsize=(15, 12))
+plt.imshow(rgb_image)
+plt.title('Classification Results for New Image', pad=20)
+
+# Create legend
+legend_elements = [
+    Patch(facecolor=color_map[i], label=inv_label_map[i])
+    for i in range(len(color_map))
+]
+
+plt.legend(
+    handles=legend_elements,
+    loc='upper left',
+    bbox_to_anchor=(1.05, 1),
+    title="Classes"
+)
+
+plt.axis('off')
+plt.tight_layout()
+plt.savefig(OUTPUT_PNG_PATH, bbox_inches='tight', dpi=300)
+print(f"💾 Saved visualization to {OUTPUT_PNG_PATH}")
+plt.show()
