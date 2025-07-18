@@ -1,3 +1,5 @@
+pip install numpy tensorflow geopandas rasterio shapely scikit-learn matplotlib
+
 import numpy as np
 import geopandas as gpd
 import rasterio
@@ -22,8 +24,7 @@ RASTER_PATH = f'{BASE_PATH}/Raster/t2.tif'
 SHAPEFILE_PATH = f'{BASE_PATH}/Vector/Samples_4.shp'
 CLASS_COLUMN = 'class'
 MODEL_DIR = f'{BASE_PATH}'
-TIFF_OUTPUT_PATH = f'{BASE_PATH}/Raster/CNN_OP_VAL_5.tif'
-PNG_OUTPUT_PATH = f'{BASE_PATH}/CNN_OP_VAL_5.png'
+
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 label_map = {
@@ -72,18 +73,21 @@ X = X[..., np.newaxis]
 y = to_categorical(labels, num_classes=len(label_map))
 
 # === Config ===
-kernel_sizes = [3, 5, 7]  # simulate 8, 16, 24 if 2D CNNs
-learning_rates = [0.001, 0.005]
+kernel_sizes = [3]  # simulate 8, 16, 24 if 2D CNNs
+learning_rates = [0.001]
 epochs = 50
 kf = KFold(n_splits=10, shuffle=True, random_state=42)
 
+# === Initialize Best Model Tracking ===
+best_model = None
+best_accuracy = 0
+best_fold_info = {'fold': 0, 'kernel': 0, 'lr': 0, 'history': None}
+
+# === K-Fold Training ===
 fold = 1
 for k in kernel_sizes:
     for lr in learning_rates:
         print(f"\n📘 Kernel Size: {k}, Learning Rate: {lr}")
-
-        fold_accuracies = []
-        best_val_loss = float('inf')
 
         for train_idx, val_idx in kf.split(X):
             print(f"\n🔁 Fold {fold}/10")
@@ -101,36 +105,137 @@ for k in kernel_sizes:
                 Dense(len(label_map), activation='softmax')
             ])
 
-            model.compile(optimizer=Adam(learning_rate=lr), loss='categorical_crossentropy', metrics=['accuracy'])
-
-            checkpoint_path = f"{MODEL_DIR}/model_k{k}_lr{lr}_fold{fold}.h5"
-            checkpoint = ModelCheckpoint(checkpoint_path, monitor='val_loss', verbose=1, save_best_only=True)
+            model.compile(optimizer=Adam(learning_rate=lr), 
+                         loss='categorical_crossentropy', 
+                         metrics=['accuracy'])
 
             history = model.fit(
                 X_train, y_train,
                 validation_data=(X_val, y_val),
                 epochs=epochs,
                 batch_size=64,
-                callbacks=[checkpoint],
                 verbose=0
             )
 
-            val_preds = model.predict(X_val, verbose=0)
-            y_true = np.argmax(y_val, axis=1)
-            y_pred = np.argmax(val_preds, axis=1)
-            acc = accuracy_score(y_true, y_pred)
-            fold_accuracies.append(acc)
-
-            val_loss = model.evaluate(X_val, y_val, verbose=0)[0]
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                print(f"✅ Saved better model with loss {val_loss:.4f} at fold {fold}")
-
-            print(f"📈 Fold {fold} Accuracy: {acc:.4f}")
-            print(classification_report(y_true, y_pred, target_names=inv_label_map.values()))
-            print(confusion_matrix(y_true, y_pred))
+            # Evaluate the model
+            val_acc = model.evaluate(X_val, y_val, verbose=0)[1]
+            
+            # Track best model
+            if val_acc > best_accuracy:
+                best_accuracy = val_acc
+                best_model = tf.keras.models.clone_model(model)
+                best_model.set_weights(model.get_weights())
+                best_fold_info = {
+                    'fold': fold,
+                    'kernel': k,
+                    'lr': lr,
+                    'history': history
+                }
+                print(f"🏆 New best model at fold {fold} with val_accuracy {val_acc:.4f}")
 
             fold += 1
 
-        print(f"\n🔚 Summary for kernel={k}, lr={lr}")
-        print("Mean Accuracy:", np.mean(fold_accuracies), "±", np.std(fold_accuracies))
+# === Save Only the Best Model ===
+if best_model is not None:
+    best_model_path = f"{MODEL_DIR}/best_model_fold{best_fold_info['fold']}.h5"
+    best_model.save(best_model_path)
+    print(f"\n💾 Saved best model from fold {best_fold_info['fold']} with val_accuracy {best_accuracy:.4f}")
+    
+    # Plot training history
+    plt.figure(figsize=(12, 5))
+    plt.suptitle(f"Best Model (Fold {best_fold_info['fold']})", y=1.05)
+    
+    plt.subplot(1, 2, 1)
+    plt.plot(best_fold_info['history'].history['accuracy'], label='Train')
+    plt.plot(best_fold_info['history'].history['val_accuracy'], label='Validation')
+    plt.title('Accuracy')
+    plt.ylabel('Accuracy')
+    plt.xlabel('Epoch')
+    plt.legend()
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(best_fold_info['history'].history['loss'], label='Train')
+    plt.plot(best_fold_info['history'].history['val_loss'], label='Validation')
+    plt.title('Loss')
+    plt.ylabel('Loss')
+    plt.xlabel('Epoch')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.show()
+else:
+    raise ValueError("No valid model was trained")
+
+# === Classify Full Raster ===
+H, W, B = image.shape
+flat_pixels = image.reshape(-1, B)
+flat_scaled = scaler.transform(flat_pixels)
+flat_scaled = flat_scaled[..., np.newaxis]
+
+# Predict in batches
+pred_labels = np.zeros(flat_scaled.shape[0], dtype=np.uint8)
+batch_size = 8192
+for i in range(0, len(flat_scaled), batch_size):
+    batch = flat_scaled[i:i+batch_size]
+    preds = best_model.predict(batch, verbose=0)
+    pred_labels[i:i+batch_size] = np.argmax(preds, axis=1)
+
+classified_image = pred_labels.reshape(H, W)
+
+# === Create Visualization ===
+color_map = np.array([
+    [144, 238, 144],  # seagrass (light green)
+    [139, 69, 19],    # land (brown)
+    [34, 139, 34],    # mangroves (green)
+    [0, 191, 255],    # water (blue)
+    [0, 100, 0]       # othervegetation (dark green)
+]) / 255  # Normalize to [0,1] for matplotlib
+
+rgb_image = color_map[classified_image]
+
+plt.figure(figsize=(15, 12))
+img = plt.imshow(rgb_image)
+
+# Create legend
+from matplotlib.patches import Patch
+legend_elements = [
+    Patch(facecolor=color_map[i], label=f"{inv_label_map[i]}") 
+    for i in range(len(color_map))
+]
+
+plt.legend(
+    handles=legend_elements,
+    loc='upper left',
+    bbox_to_anchor=(1.05, 1),
+    title="Classes",
+    frameon=True,
+    facecolor='white'
+)
+
+plt.title(f"Classification Map (Best Fold {best_fold_info['fold']}, Acc: {best_accuracy:.2f})", pad=20)
+plt.axis('off')
+plt.tight_layout()
+plt.show()
+
+# === Save Results ===
+output_path = f"{MODEL_DIR}/classification_fold{best_fold_info['fold']}.png"
+plt.savefig(output_path, bbox_inches='tight', dpi=300)
+print(f"✅ Saved classification map to {output_path}")
+
+# Save GeoTIFF
+output_tif_path = f"{MODEL_DIR}/classified_output.tif"
+with rasterio.open(
+    output_tif_path,
+    'w',
+    driver='GTiff',
+    height=H,
+    width=W,
+    count=1,
+    dtype=rasterio.uint8,
+    crs=raster.crs,
+    transform=raster.transform
+) as dst:
+    dst.write(classified_image.astype(np.uint8), 1)
+print(f"✅ Saved classified GeoTIFF to {output_tif_path}")
+
+plt.show()
